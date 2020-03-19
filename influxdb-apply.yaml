@@ -1,0 +1,18 @@
+# influxdb-apply.yaml
+users:
+ # First user must have a password and grant_all_privileges:true .
+ - name: admin
+   password: 'pass-admin'
+   grant_all_privileges: true
+ - name: telegraf
+   password: 'pass-telegraf'  # For HTTP Basic authentication.
+ - name: grafana
+   password: 'pass-grafana'
+ - name: user2  # Authenticates with a token.  Gets new random password on every apply.
+
+databases:
+ - name: _internal # Do not delete.
+ - name: db1
+   grant_read_to: [grafana]
+   grant_write_to: [telegraf, user2]
+   grant_all_to: []

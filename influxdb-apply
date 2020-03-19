@@ -1,0 +1,463 @@
+#!/usr/bin/python2
+# Copyright (c) 2020 Leonhard LLC
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# TODO(leonhard) Make database default retention duration configurable via config file.
+import collections
+import httplib
+import logging
+import os.path
+import random
+import sys
+import time
+import traceback
+
+import jsonschema
+import requests
+import yaml
+
+RNG = random.SystemRandom()
+
+
+def none_to_empty_dict(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('Value is not a dict: %r' % (value,))
+    return value
+
+
+def none_to_empty_list(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError('Value is not a list: %r' % (value,))
+    return value
+
+
+def none_to_empty_string(value):
+    if value is None:
+        return ''
+    if not isinstance(value, str) and not isinstance(value, unicode):
+        raise ValueError('Value is not a string or None: %r' % (value,))
+    return value
+
+
+def none_to_false(value):
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError('Value is not bool: %r' % (value,))
+    return value
+
+
+def check_no_duplicates(items, description):
+    dupes = [item for (item, count) in collections.Counter(items).items() if count > 1]
+    if len(dupes) != 0:
+        raise ValueError('Duplicate %s: %s' % (description, ' '.join(str(dupes))))
+
+
+class User:
+    def __init__(self, section):
+        self.name = none_to_empty_string(section.get('name'))
+        self.password = none_to_empty_string(section.get('password'))
+        self.grant_all_privileges = none_to_false(section.get('grant_all_privileges'))
+
+    def __str__(self):
+        return 'User{' + self.name + (' pass=...' if self.password else '') + (
+            ' grant_all_privileges=true' if self.grant_all_privileges else '') + '}'
+
+
+class Database:
+    def __init__(self, section):
+        self.name = none_to_empty_string(section.get('name'))
+        self.grant_read_to = [
+            none_to_empty_string(e) for e in none_to_empty_list(section.get('grant_read_to'))]
+        self.grant_write_to = [
+            none_to_empty_string(e) for e in none_to_empty_list(section.get('grant_write_to'))]
+        self.grant_all_to = [
+            none_to_empty_string(e) for e in none_to_empty_list(section.get('grant_all_to'))]
+        check_no_duplicates(self.granted_users(), 'users in database %s grants' % (self.name,))
+
+    def granted_users(self):
+        return self.grant_read_to + self.grant_write_to + self.grant_all_to
+
+    def __str__(self):
+        read_part = (' grant_read_to=' + ','.join(self.grant_read_to)) if self.grant_read_to else ''
+        write_part = (
+                ' grant_write_to=' + ','.join(self.grant_write_to)) if self.grant_write_to else ''
+        all_part = (' grant_all_to=' + ','.join(self.grant_all_to)) if self.grant_all_to else ''
+        return 'Database{' + self.name + read_part + write_part + all_part + '}'
+
+
+class TargetConfig:
+    def __init__(self, users, databases):
+        assert isinstance(users, list)
+        for user in users:
+            assert isinstance(user, User)
+        assert isinstance(databases, list)
+        for database in databases:
+            assert isinstance(database, Database)
+        self.users = users
+        self.databases = databases
+        if len(users) == 0:
+            raise ValueError('Users list is empty')
+        if users[0].password == '':
+            raise ValueError('First user does not have a password')
+        if not users[0].grant_all_privileges:
+            raise ValueError('First user does not have grant_all_privileges:true')
+        self.admin = users[0]
+        user_names = [user.name for user in users]
+        check_no_duplicates(user_names, 'user names')
+        check_no_duplicates([database.name for database in databases], 'database names')
+        for database in databases:
+            for user in database.granted_users():
+                if user not in user_names:
+                    raise ValueError(
+                        'Database %s has grant for undefined user %s' % (database.name, user))
+        self.name_to_user = {user.name: user for user in users}
+        self.name_to_database = {database.name: database for database in databases}
+
+
+def read_yaml_doc(filepath):
+    schema = yaml.safe_load('''
+        # https://yaml.org/refcard.html
+        # https://json-schema.org/understanding-json-schema/reference/index.html
+        type: object
+        additionalProperties: false
+        required: [users, databases]
+        properties:
+          users:
+            type: array
+            items:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  pattern: "^[a-zA-Z][-_a-zA-Z0-9]*$"
+                  minLength: 1
+                  maxLength: 32
+                password:
+                  type: string
+                  minLength: 1
+                  maxLength: 32
+                grant_all_privileges:
+                  type: boolean
+          databases:
+            type: array
+            items:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  # "You will need to wrap identifiers in double quotes in queries if they contain
+                  # characters other than [A-z,_].
+                  # https://docs.influxdata.com/influxdb/v1.7/concepts/schema_and_data_layout/
+                  # "InfluxDB should restrict names/keys"
+                  # https://github.com/influxdata/influxdb/issues/6011
+                  pattern: "^([a-zA-Z][_a-zA-Z0-9]*)|(_internal)$"
+                  minLength: 1
+                  maxLength: 32
+                grant_read_to:
+                  type: array
+                  items:
+                    type: string
+                grant_write_to:
+                  type: array
+                  items:
+                    type: string
+                grant_all_to:
+                  type: array
+                  items:
+                    type: string
+        ''')
+    logging.debug('Schema %s' % (schema,))
+    logging.info('Reading %s' % (filepath,))
+    with open(filepath, 'r') as f:
+        doc = none_to_empty_dict(yaml.safe_load(f))
+        logging.debug('Read \n%s' % (doc,))
+    # noinspection PyBroadException
+    try:
+        # https://python-jsonschema.readthedocs.io/en/stable/errors/
+        doc['users'] = none_to_empty_list(doc.get('users'))
+        doc['databases'] = none_to_empty_list(doc.get('databases'))
+        jsonschema.validate(doc, schema)
+        users = [User(section) for section in doc['users']]
+        databases = [Database(section) for section in doc['databases']]
+        return TargetConfig(users, databases)
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.write('Failed loading %s\n' % (filepath,))
+        sys.exit(1)
+
+
+class InfluxDbCaller:
+    SCHEMA = yaml.safe_load('''
+        # Example result:
+        # results:
+        #   - statement_id: 0
+        #     series:
+        #       - columns': [user, admin]
+        #         values':
+        #           - [admin, true]
+        #
+        # https://yaml.org/refcard.html
+        # https://json-schema.org/understanding-json-schema/reference/index.html
+        type: object
+        additionalProperties: false
+        required: [results]
+        properties:
+          results:
+            type: array
+            minItems: 1
+            maxItems: 1
+            items:
+              type: object
+              additionalProperties: false
+              required: [statement_id]
+              properties:
+                statement_id:
+                  type: integer
+                  minimum: 0
+                  maximum: 0
+                series:
+                  type: array
+                  minItems: 0
+                  maxItems: 1
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [columns]
+                    properties:
+                      columns:
+                        type: array
+                        minItems: 1
+                        items:
+                          type: string
+                      values:
+                        type: array
+                        items:
+                          type: array
+                      name:
+                        type: string
+        ''')
+
+    def __init__(self, url, username, password):
+        self.url = url
+        self.username = username
+        self.password = password
+
+    def wait_for_healthy(self):
+        url = self.url + '/ping'
+        logging.info("Waiting for " + url)
+        deadline = time.time() + 120
+        while True:
+            try:
+                r = requests.get(url, timeout=5)
+                logging.info('  %s %s: %s' % (r.status_code, r.reason, r.text))
+                if r.status_code == 204:
+                    return
+            except IOError as e:
+                logging.info('  %s' % (e.message,))
+            if time.time() > deadline:
+                raise Exception('Timed out waiting for server to start.')
+            time.sleep(5)
+
+    def call(self, query, log=True):
+        if log:
+            logging.info(query)
+        # https://requests.kennethreitz.org/en/master/user/quickstart
+        # https://requests.kennethreitz.org/en/master/api
+        r = requests.post(self.url + '/query', params={'q': query},
+                          auth=(self.username, self.password), timeout=60)
+        if r.status_code != 200:
+            raise Exception('%s %s: %s' % (r.status_code, r.reason, r.text))
+        # r.raise_for_status()  # Prints the url, which may have passwords.  Don't use.
+
+        doc = r.json()
+        # noinspection PyBroadException
+        try:
+            jsonschema.validate(doc, self.SCHEMA)
+            results = doc['results']
+            result = results[0]
+            series_list = none_to_empty_list(result.get('series'))
+            if len(series_list) == 0:
+                return []
+            series = series_list[0]
+            columns = series['columns']
+            result_type = collections.namedtuple('result_row', columns)
+            results = []
+            for row in none_to_empty_list(series.get('values')):
+                if len(row) != len(columns):
+                    raise Exception(
+                        'Row length does not match column length: columns=%r row=%r' % (
+                            columns, row,))
+                results.append(result_type(*row))
+            return results
+        except Exception:
+            traceback.print_exc()
+            sys.stderr.write('Error processing server response" %s\n' % (doc,))
+            sys.exit(1)
+
+
+def add_admin_user(caller, config):
+    # A fresh InfluxDB installation with no users will silently ignore credentials and accept only a
+    # command to create an admin user.  Creating a user with the same password is idempotent.
+    # https://docs.influxdata.com/influxdb/v1.7/administration/authentication_and_authorization/
+    logging.info(
+        "CREATE USER \"%s\" WITH PASSWORD '...' WITH ALL PRIVILEGES" % (config.admin.name,))
+    caller.call("CREATE USER \"%s\" WITH PASSWORD '%s' WITH ALL PRIVILEGES" % (
+        config.admin.name, config.admin.password.replace("'", "\\'")), log=False)
+
+
+def random_password():
+    return ''.join(
+        [RNG.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in
+         xrange(32)])
+
+
+def update_users(caller, config):
+    rows = caller.call('SHOW USERS')
+    for row in rows:
+        logging.info('  %s' % (row,))
+    logging.info('Target users:')
+    for user in config.users:
+        logging.info('  %s' % (user,))
+    existing_usernames = frozenset([row.user for row in rows])
+    # Drop users.
+    for row in rows:
+        if row.user not in config.name_to_user:
+            caller.call('DROP USER "%s"' % (row.user,))
+    # Update users.
+    for row in rows:
+        if row.user in config.name_to_user:
+            user = config.name_to_user[row.user]
+            # Set password.  There's no way to query a user's password so we must always set.
+            if user.password:
+                logging.info("SET PASSWORD FOR \"%s\" = '...'" % (user.name,))
+                caller.call("SET PASSWORD FOR \"%s\" = '%s'" % (
+                    user.name, user.password.replace("'", "\\'")), log=False)
+            else:
+                logging.info("SET PASSWORD FOR \"%s\" = '<random password>'" % (user.name,))
+                caller.call(
+                    "SET PASSWORD FOR \"%s\" = '%s'" % (user.name, random_password()), log=False)
+            # Update "all privileges".
+            if row.admin and not user.grant_all_privileges:
+                caller.call('REVOKE ALL PRIVILEGES FROM "%s"' % (row.user,))
+            elif not row.admin and user.grant_all_privileges:
+                caller.call('GRANT ALL PRIVILEGES TO "%s"' % (row.user,))
+    # Add users.
+    for user in config.users:
+        if user.name not in existing_usernames:
+            password = user.password if user.password else random_password()
+            password_for_log = '...' if user.password else '<random password>'
+            privileges_clause = ' WITH ALL PRIVILEGES' if user.grant_all_privileges else ''
+            logging.info("CREATE USER \"%s\" WITH PASSWORD '%s'%s" % (
+                user.name, password_for_log, privileges_clause))
+            caller.call("CREATE USER \"%s\" WITH PASSWORD '%s'%s" % (
+                user.name, password.replace("'", "\\'"), privileges_clause), log=False)
+
+
+def update_databases(caller, config):
+    rows = caller.call('SHOW DATABASES')
+    existing_database_names = sorted([row.name for row in rows])
+    logging.info('Existing databases: %s' % (' '.join(existing_database_names),))
+    logging.info('Target databases: %s' % (' '.join([db.name for db in config.databases]),))
+    # Drop databases.
+    for row in rows:
+        if row.name not in config.name_to_database:
+            caller.call('DROP DATABASE "%s"' % (row.name,))
+    # Add databases.
+    for database in config.databases:
+        if database.name not in existing_database_names:
+            caller.call('CREATE DATABASE "%s" WITH DURATION 14d' % (database.name,))
+
+
+def update_grants(caller, config, user):
+    rows = caller.call('SHOW GRANTS FOR "%s"' % (user.name,))
+    existing_read = set()
+    existing_write = set()
+    for row in rows:
+        if row.privilege in ('READ', 'ALL PRIVILEGES'):
+            existing_read.add(row.database)
+        if row.privilege in ('WRITE', 'ALL PRIVILEGES'):
+            existing_write.add(row.database)
+    target_read = set()
+    target_write = set()
+    for database in config.databases:
+        if user.name in database.grant_read_to or user.name in database.grant_all_to:
+            target_read.add(database.name)
+        if user.name in database.grant_write_to or user.name in database.grant_all_to:
+            target_write.add(database.name)
+    logging.info('User %s read privileges: existing=%s target=%s' % (
+        user.name,
+        ','.join(sorted(existing_read)),
+        ','.join(sorted(target_read))))
+    logging.info('User %s write privileges: existing=%s target=%s' % (
+        user.name,
+        ','.join(sorted(existing_write)),
+        ','.join(sorted(target_write))))
+
+    existing_all = existing_read & existing_write
+    target_all = target_read & target_write
+
+    for database_name in ((existing_read | existing_write) - target_read - target_write):
+        caller.call('REVOKE ALL ON "%s" FROM "%s"' % (database_name, user.name))
+    for database_name in (target_read - target_all - existing_read):
+        caller.call('GRANT READ ON "%s" TO "%s"' % (database_name, user.name))
+    for database_name in (target_write - target_all - existing_write):
+        caller.call('GRANT WRITE ON "%s" TO "%s"' % (database_name, user.name))
+    for database_name in (target_all - existing_all):
+        caller.call('GRANT ALL ON "%s" TO "%s"' % (database_name, user.name))
+
+
+def main(args):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%SZ',
+    )
+    if os.environ.get('DEBUG'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        httplib.HTTPConnection.debuglevel = 1
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+
+    if len(args) != 3:
+        logging.error('Usage: %s YAML_FILE URL' % (os.path.basename(args[0]),))
+        sys.exit(1)
+    config = read_yaml_doc(os.path.abspath(args[1]))
+    url = args[2].rstrip('/')
+    logging.info('Using url %s' % (url,))
+    caller = InfluxDbCaller(url, config.admin.name, config.admin.password)
+    caller.wait_for_healthy()
+    add_admin_user(caller, config)
+    update_users(caller, config)
+    update_databases(caller, config)
+    for user in config.users:
+        update_grants(caller, config, user)
+    logging.info('Done.')
+
+
+if __name__ == "__main__":
+    main(sys.argv)
