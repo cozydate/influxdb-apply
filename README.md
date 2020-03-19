@@ -1,6 +1,6 @@
 # influxdb-apply
 
-This is a Python 2 program that reads an `influxdb-apply.yaml` file and updates InfluxDB users and
+`influxdb-apply` is a Python 2 program that reads an `influxdb-apply.yaml` file and updates InfluxDB users and
 databases to match what's in the file.  It deletes all users and databases not in the config file.
 
 ```yaml
@@ -28,7 +28,7 @@ A good way to make passwords:
 
 ```$ python -c 'import random; r = random.SystemRandom(); print "".join([r.choice("123456789CDFGHJKLMNPQRTVWXZ") for n in range(12)])'```
 
-Check out [`Dockerfile`](blob/master/Dockerfile) and [`init-influxdb.sh`](blob/master/init-influxdb.sh) to see how this works.
+Check out [`Dockerfile`](Dockerfile) and [`init-influxdb.sh`](init-influxdb.sh) to see how this works.
 
 Example usage:
 ```
