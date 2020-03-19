@@ -12,5 +12,7 @@ ADD influxdb-apply /influxdb-apply
 ADD influxdb-apply.yaml /influxdb-apply.yaml
 # Make influxdb-apply accept the certificate.
 ENV REQUESTS_CA_BUNDLE=/etc/influxdb/ca_cert.pem
-# Overwrite buggy /init-influxdb.sh script.
-ADD init-influxdb.sh /init-influxdb.sh
+
+# Don't use buggy /init-influxdb.sh script.
+ADD entrypoint.sh /entrypoint.sh
+ENTRYPOINT /entrypoint.sh
