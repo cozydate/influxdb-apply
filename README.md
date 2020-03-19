@@ -31,7 +31,7 @@ databases:
    grant_all_to: []
 ```
 
-## Examole
+## Example
 
 Build the Docker image from [`Dockerfile`](Dockerfile):
 ```
