@@ -25,9 +25,10 @@ databases:
 ```
 
 A good way to make passwords:
+
 ```$ python -c 'import random; r = random.SystemRandom(); print "".join([r.choice("123456789CDFGHJKLMNPQRTVWXZ") for n in range(12)])'```
 
-Check out `Dockerfile` and `init-influxdb.sh` to see how this works.
+Check out [`Dockerfile`](blob/master/Dockerfile) and [`init-influxdb.sh`](blob/master/init-influxdb.sh) to see how this works.
 
 Example usage:
 ```
@@ -185,8 +186,15 @@ X-Influxdb-Version: 1.7.10
 X-Request-Id: ea9c21e2-6970-11ea-8012-0242ac110002
 Date: Wed, 18 Mar 2020 23:33:48 GMT
 
-$ for n in $(seq 1 5); do curl --cacert openssl/ca_cert.pem --user telegraf:pass-telegraf --request POST 'https://localhost:8086/write?db=db1' --data-binary "metric1,host=host1,tag1=val1 value=$n $(date '+%s')000000000"; sleep 1; done
-$ curl --cacert openssl/ca_cert.pem --user grafana:pass-grafana 'https://localhost:8086/query?pretty=true' --data-urlencode 'db=db1' --data-urlencode "q=SELECT \"value\" FROM \"metric1\" WHERE \"host\" = 'host1' ORDER BY time DESC LIMIT 3"
+$ for n in $(seq 1 5); do
+curl --cacert openssl/ca_cert.pem --user telegraf:pass-telegraf  --request POST \
+  'https://localhost:8086/write?db=db1' \
+  --data-binary "metric1,host=host1,tag1=val1 value=$n $(date '+%s')000000000";
+sleep 1;
+done
+$ curl --cacert openssl/ca_cert.pem --user grafana:pass-grafana \
+ 'https://localhost:8086/query?pretty=true&db=db1' \
+ --data-urlencode "q=SELECT \"value\" FROM \"metric1\" WHERE \"host\" = 'host1' ORDER BY time DESC LIMIT 3"
 {
     "results": [
         {
